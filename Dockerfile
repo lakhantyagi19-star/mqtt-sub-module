@@ -1,27 +1,20 @@
-# Use full image (has more build tools than slim)
-FROM python:3.11
+# ARM64 IoT Edge python base (Debian bookworm, ARM64v8)
+FROM mcr.microsoft.com/azureiotedge/python:3.11-bookworm-arm64v8
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
-# System libs needed for uamqp build on ARM64
+# (Usually already present, but safe to include the dev headers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    gcc g++ make cmake \
-    uuid-dev \
-    libssl-dev \
-    libffi-dev \
-    libcurl4-openssl-dev \
-    pkg-config \
-    zlib1g-dev \
-    git \
+    libssl-dev libffi-dev uuid-dev cmake pkg-config git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
 
-# Upgrade build tooling, preinstall a compatible uamqp wheel, then the rest
+# Force a prebuilt wheel for uamqp on ARM64 (manylinux2014_aarch64 exists)
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir uamqp==1.6.8 && \
+    pip install --only-binary=:all: uamqp==1.6.8 && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
