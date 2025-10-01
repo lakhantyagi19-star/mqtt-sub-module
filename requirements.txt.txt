@@ -1,0 +1,2 @@
+paho-mqtt==2.*
+azure-iot-device==2.*
