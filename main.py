@@ -1,199 +1,162 @@
+# main.py
 import os
 import json
-import signal
 import asyncio
-import threading
-import time
-from typing import Optional
+import ssl
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 from azure.iot.device.aio import IoTHubModuleClient
 from azure.iot.device import Message
-from azure.iot.device import exceptions as iot_exceptions
 
-# ========= Config via ENV (with defaults) =========
-BROKER_HOST   = os.getenv("BROKER__HOST", "test.mosquitto.org")
-BROKER_PORT   = int(os.getenv("BROKER__PORT", "1883"))
-BROKER_USER   = os.getenv("BROKER__USERNAME", "") or None
-BROKER_PASS   = os.getenv("BROKER__PASSWORD", "") or None
-SUB_TOPIC     = os.getenv("SUB__TOPIC", "sensors/+/temperature")
-KEEPALIVE     = int(os.getenv("MQTT_KEEPALIVE", "60"))
-USE_TLS       = os.getenv("MQTT_TLS", "false").lower() in ("1", "true", "yes")
-THRESHOLD     = float(os.getenv("THRESHOLD", "30"))
-IOTHUB_OUTPUT = os.getenv("IOTHUB_OUTPUT", "filtered")
+# ----------------------------
+# Config via environment vars
+# ----------------------------
+MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "sensors/+/temperature")
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_TLS = os.getenv("MQTT_TLS", "false").lower() == "true"
 
-RETRY_BACKOFF_SECS = [2, 4, 8, 16, 30]  # backoff for IoT Hub connect retries
+# Default threshold (can be overridden by module twin desired.properties.threshold)
+THRESHOLD = float(os.getenv("DEFAULT_THRESHOLD", "30"))
 
-# ========= Globals & helpers =========
-_stop_event = threading.Event()
+# Edge DeviceId is injected by IoT Edge env
+EDGE_DEVICE_ID = os.getenv("IOTEDGE_DEVICEID", "edge-gw")
 
+PRINT_PREFIX = "[mqtt-sub]"
 
-def log(*parts):
-    print("[mqtt-sub]", *parts, flush=True)
-
-
-def to_float(payload_bytes: bytes) -> Optional[float]:
-    try:
-        s = payload_bytes.decode("utf-8", errors="ignore").strip()
-        return float(s)
-    except Exception:
-        return None
+def _log(msg: str):
+    print(f"{PRINT_PREFIX} {msg}", flush=True)
 
 
-# ========= Bridge class =========
-class MqttToIoTEdgeBridge:
+class Bridge:
+    """
+    Subscribes to MQTT -> filters on temperature -> emits to EdgeHub output 'hotOut'
+    Twin desired.properties.threshold controls the threshold at runtime.
+    """
     def __init__(self):
-        self.mqtt_client: Optional[mqtt.Client] = None
-        self.module_client: Optional[IoTHubModuleClient] = None
         self.loop = asyncio.get_event_loop()
+        self.edge_client: IoTHubModuleClient | None = None
+        self.mqtt_client: mqtt.Client | None = None
+        self.threshold = THRESHOLD
 
-    # ----- IoT Edge (ModuleClient) -----
+    # ------------- Edge (IoT Hub) side -------------
     async def init_edge(self):
-        """Create ModuleClient from Edge environment and connect with retries."""
-        # Create from edge environment. This only works when running **as an IoT Edge module**.
-        try:
-            self.module_client = IoTHubModuleClient.create_from_edge_environment()
-        except Exception as e:
-            log("ERROR: Not running inside IoT Edge environment or env not set. "
-                "ModuleClient creation failed:", repr(e))
-            self.module_client = None
-            return
+        self.edge_client = IoTHubModuleClient.create_from_edge_environment()
+        await self.edge_client.connect()
+        _log("Connected to IoT Hub via Edge Hub ✅")
 
-        # Retry connect with backoff
-        for i, delay in enumerate([0] + RETRY_BACKOFF_SECS):
+        # Pull current twin + subscribe to patches
+        twin = await self.edge_client.get_twin()
+        self._apply_desired(twin.get("desired", {}))
+
+        def on_patch(patch):
+            # Called on desired property updates
+            self._apply_desired(patch)
+
+        self.edge_client.on_twin_desired_properties_patch_received = on_patch
+
+    def _apply_desired(self, desired: dict):
+        if "threshold" in desired:
             try:
-                if delay:
-                    log(f"IoT Hub connect retry in {delay}s (attempt {i+1}) …")
-                    await asyncio.sleep(delay)
-                log("Connecting to IoT Hub via Edge Hub …")
-                await self.module_client.connect()
-                log("Connected to IoT Hub ✅")
-                return
-            except (iot_exceptions.ConnectionFailedError, iot_exceptions.ClientError, Exception) as e:
-                log("IoT Hub connect failed:", repr(e))
-        log("FATAL: Could not connect to IoT Hub after retries.")
-        # Keep running anyway — we can still log locally; messages will be skipped.
+                self.threshold = float(desired["threshold"])
+                _log(f"[Twin] threshold -> {self.threshold}")
+            except Exception as e:
+                _log(f"[Twin] bad threshold value: {desired.get('threshold')} ({e})")
 
-    async def send_to_iothub(self, body: dict):
-        """Send a JSON message to IoT Hub output, if ModuleClient is available."""
-        if not self.module_client:
-            return  # running without Edge or connection failed
+    async def send_hot(self, body: dict):
+        """
+        Sends one JSON message to output 'hotOut' (which should be routed to $upstream).
+        """
+        if not self.edge_client:
+            _log("Edge client not ready; dropping message")
+            return
         try:
             msg = Message(json.dumps(body))
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
-            await self.module_client.send_message_to_output(msg, IOTHUB_OUTPUT)
+            await self.edge_client.send_message_to_output(msg, "hotOut")
+            _log(f"Sent HOT event upstream: {body}")
         except Exception as e:
-            log("WARNING: send_message_to_output failed:", repr(e))
+            _log(f"Failed to send message to output 'hotOut': {e}")
 
-    # ----- MQTT side -----
-    def _on_connect(self, client, userdata, flags, rc):
-        # v1 API signature: rc is int (0=success)
-        if rc == 0:
-            log("MQTT connected ✅ rc=0. Subscribing to:", SUB_TOPIC)
-            client.subscribe(SUB_TOPIC)
-        else:
-            log(f"MQTT connect failed rc={rc}")
-
-    def _on_message(self, client, userdata, msg):
-        val = to_float(msg.payload)
-        if val is None:
-            log(f"Ignoring non-numeric payload on {msg.topic}: {msg.payload[:64]!r}")
-            return
-
-        # Filtering logic
-        if val > THRESHOLD:
-            data = {
-                "topic": msg.topic,
-                "value": val,
-                "threshold": THRESHOLD,
-                "ts": int(time.time()),
-            }
-            log("Exceeded → forwarding to IoT Hub:", data)
-
-            # Use asyncio thread-safe call to send via ModuleClient
-            if self.module_client:
-                asyncio.run_coroutine_threadsafe(self.send_to_iothub(data), self.loop)
-            else:
-                # No IoT Edge binding; just print
-                log("No ModuleClient; printed only:", data)
-        else:
-            # Below threshold; ignore (or log verbosely if you like)
-            pass
-
-    def _on_disconnect(self, client, userdata, rc):
-        # rc != 0 means unexpected disconnect
-        if rc != 0:
-            log("MQTT disconnected unexpectedly. rc=", rc)
-
+    # ------------- MQTT side -------------
     def start_mqtt(self):
-        """Create and start the MQTT client in loop_start mode (non-blocking)."""
-        client = mqtt.Client()  # v1 constructor; DO NOT use CallbackAPIVersion (that’s v2 only)
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-        if BROKER_USER and BROKER_PASS:
-            client.username_pw_set(BROKER_USER, BROKER_PASS)
+        # Auth / TLS if provided
+        if MQTT_TLS:
+            # NOTE: for public brokers you may need to provide CA if verification fails
+            self.mqtt_client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+        if MQTT_USERNAME or MQTT_PASSWORD:
+            self.mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-        if USE_TLS:
-            # Basic TLS (you can extend with CA/certs via more env vars if needed)
-            client.tls_set()  # Use system CAs
-            log("TLS enabled for MQTT")
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            _log(f"MQTT connected rc={reason_code}. Subscribing to: {MQTT_TOPIC}")
+            client.subscribe(MQTT_TOPIC, qos=1)
 
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
-        client.on_disconnect = self._on_disconnect
-
-        # Connect and start loop
-        client.connect(BROKER_HOST, BROKER_PORT, KEEPALIVE)
-        client.loop_start()
-        self.mqtt_client = client
-        log(f"MQTT connecting to {BROKER_HOST}:{BROKER_PORT}, topic='{SUB_TOPIC}', "
-            f"threshold={THRESHOLD}")
-
-    def stop_mqtt(self):
-        if self.mqtt_client is not None:
+        def on_message(client, userdata, msg):
+            """
+            Decode bytes -> JSON -> validate numeric temperature -> filter -> async send to Edge
+            """
             try:
-                self.mqtt_client.loop_stop()
-                self.mqtt_client.disconnect()
-            except Exception:
-                pass
+                payload_str = msg.payload.decode("utf-8", errors="strict")
+                data = json.loads(payload_str)
 
-    # ----- Orchestration -----
+                # Accept common keys: "temperature" or "temp"
+                raw_temp = data.get("temperature", data.get("temp", None))
+                if raw_temp is None:
+                    _log(f"Ignoring payload without 'temperature' key on {msg.topic}: {payload_str}")
+                    return
+
+                # Coerce to float safely
+                try:
+                    temp = float(raw_temp)
+                except Exception:
+                    _log(f"Ignoring non-numeric temperature on {msg.topic}: {payload_str}")
+                    return
+
+                # Pass only 'hot' messages
+                if temp > self.threshold:
+                    out = {
+                        "device": data.get("device") or EDGE_DEVICE_ID,
+                        "temperature": temp,
+                        "topic": msg.topic,
+                        "ts": datetime.now(timezone.utc).isoformat()
+                    }
+                    # Send asynchronously into EdgeHub output hotOut
+                    asyncio.run_coroutine_threadsafe(self.send_hot(out), self.loop)
+                # else: silently drop cool messages
+
+            except json.JSONDecodeError:
+                _log(f"Ignoring invalid JSON on {msg.topic}: {msg.payload!r}")
+            except UnicodeDecodeError:
+                _log(f"Ignoring non-UTF8 bytes on {msg.topic}")
+            except Exception as e:
+                _log(f"Unexpected error processing MQTT message: {e}")
+
+        self.mqtt_client.on_connect = on_connect
+        self.mqtt_client.on_message = on_message
+
+        _log(f"BROKER={MQTT_HOST}:{MQTT_PORT} TLS={MQTT_TLS} "
+             f"TOPIC='{MQTT_TOPIC}' THRESHOLD={self.threshold}")
+        self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+        self.mqtt_client.loop_start()
+
+    # ------------- Main run loop -------------
     async def run(self):
-        # 1) Initialize IoT Edge client (non-fatal if missing)
         await self.init_edge()
-
-        # 2) Start MQTT
         self.start_mqtt()
+        # Keep process alive
+        while True:
+            await asyncio.sleep(60)
 
-        # 3) Wait for stop signal
-        while not _stop_event.is_set():
-            await asyncio.sleep(0.5)
-
-        # 4) Cleanup
-        self.stop_mqtt()
-        if self.module_client:
-            try:
-                await self.module_client.shutdown()
-            except Exception:
-                pass
-
-
-# ========= Entrypoint =========
-def _handle_signal(signum, frame):
-    log(f"Signal {signum} received → shutting down …")
-    _stop_event.set()
-
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
 
 if __name__ == "__main__":
-    log("Starting mqtt-sub module …")
-    log(f"BROKER={BROKER_HOST}:{BROKER_PORT} TLS={USE_TLS} TOPIC='{SUB_TOPIC}' THRESHOLD={THRESHOLD}")
     try:
-        asyncio.run(MqttToIoTEdgeBridge().run())
+        bridge = Bridge()
+        asyncio.run(bridge.run())
     except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        log("Fatal error:", repr(e))
-    finally:
-        log("Exited.")
+        _log("Shutting down...")
