@@ -75,7 +75,7 @@ class MqttToIoTEdgeBridge:
     def __init__(self):
         self.mqtt_client: Optional[mqtt.Client] = None
         self.module_client: Optional[IoTHubModuleClient] = None
-        self.loop = asyncio.get_event_loop()
+        self.loop: Optional[asyncio.AbstractEventLoop] = None   # <-- set later in run()
         self.threshold = DEFAULT_THRESHOLD
 
     # ----- IoT Edge (ModuleClient) -----
@@ -171,10 +171,11 @@ class MqttToIoTEdgeBridge:
             }
             log("Exceeded → forwarding to IoT Hub:", data)
 
-            if self.module_client:
+            # Schedule send on the actual running loop captured in run()
+            if self.module_client and self.loop:
                 asyncio.run_coroutine_threadsafe(self.send_to_iothub(data), self.loop)
             else:
-                log("No ModuleClient; printed only:", data)
+                log("No ModuleClient/loop; printed only:", data)
         else:
             # Below threshold
             pass
@@ -214,6 +215,8 @@ class MqttToIoTEdgeBridge:
 
     # ----- Orchestration -----
     async def run(self):
+        # Capture the *running* loop created by asyncio.run()
+        self.loop = asyncio.get_running_loop()
         await self.init_edge()
         self.start_mqtt()
         while not _stop_event.is_set():
